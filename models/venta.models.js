@@ -1,5 +1,9 @@
 const { getConnection, sql } = require('../config/database');
 
+function round2(n) {
+    return Math.round(n * 100) / 100;
+}
+
 class VentaModel {
     static async registrarVenta(datosVenta) {
         const pool = await getConnection();
@@ -108,14 +112,23 @@ class VentaModel {
             const pool = await getConnection();
             const ventaResult = await pool.request()
                 .input('Id', sql.Int, id)
-                .query('SELECT * FROM Ventas WHERE Id = @Id');
+                .query(`
+                    SELECT v.*, u.Nombre AS Usuario, mp.Nombre AS MetodoPago
+                    FROM Ventas v
+                    JOIN Usuarios u ON v.UsuarioId = u.Id
+                    JOIN MetodosPago mp ON v.MetodoPagoId = mp.Id
+                    WHERE v.Id = @Id
+                `);
 
             if (ventaResult.recordset.length === 0) return null;
 
+            // Se une con Productos para traer el % de IVA vigente de cada producto y
+            // así poder desglosar el IVA en la factura (el precio de venta ya lo trae
+            // incluido, por la fórmula costo + margen + IVA que usa Inventario).
             const detalleResult = await pool.request()
                 .input('VentaId', sql.Int, id)
                 .query(`
-                    SELECT dv.*, p.Nombre AS ProductoNombre 
+                    SELECT dv.*, p.Nombre AS ProductoNombre, p.PorcentajeIva
                     FROM DetalleVentas dv
                     JOIN Productos p ON dv.ProductoId = p.Id
                     WHERE dv.VentaId = @VentaId
@@ -123,6 +136,31 @@ class VentaModel {
 
             const venta = ventaResult.recordset[0];
             venta.items = detalleResult.recordset;
+
+            // IVA desglosado por línea: para cada producto, la parte del precio que
+            // corresponde a IVA es CostoUnitario * PorcentajeIva% (el mismo cálculo que
+            // usa Inventario al fijar el precio de venta). Se enriquece cada item con
+            // PrecioSinIva (precio unitario sin IVA) e IvaLinea (IVA total de esa línea,
+            // ya multiplicado por la cantidad) para que la factura pueda mostrar la
+            // columna de IVA producto por producto.
+            venta.items = venta.items.map(item => {
+                const ivaUnitario = (item.CostoUnitario || 0) * ((item.PorcentajeIva || 0) / 100);
+                return {
+                    ...item,
+                    PrecioSinIva: round2(item.PrecioUnitario - ivaUnitario),
+                    IvaLinea: round2(ivaUnitario * item.Cantidad)
+                };
+            });
+
+            const impuestosCalculados = venta.items.reduce((acc, item) => acc + item.IvaLinea, 0);
+            venta.Impuestos = round2(impuestosCalculados);
+            // El Subtotal general es la suma de precios SIN IVA (antes de impuesto),
+            // no el valor tal cual quedó guardado en Ventas.Subtotal al momento de la
+            // venta (ese sí incluye IVA, porque el precio de venta ya lo trae incluido).
+            venta.Subtotal = round2(venta.items.reduce((acc, item) => acc + (item.PrecioSinIva * item.Cantidad), 0));
+            // Porcentaje representativo para mostrar en la factura (ej. "IVA (19%)").
+            // Normalmente es el mismo para todos los productos de la venta.
+            venta.PorcentajeIvaFactura = venta.items.length > 0 ? venta.items[0].PorcentajeIva : 19;
 
             return venta;
         } catch (error) {
