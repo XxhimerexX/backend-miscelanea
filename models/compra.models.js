@@ -15,14 +15,22 @@ class CompraModel {
                 const productoId = parseInt(item.productoId, 10);
                 const cantidadPedida = parseInt(item.cantidadPedida, 10);
                 const costoUnitario = parseFloat(item.costoUnitario);
+                // Descuento por línea en porcentaje (0-100). Si no viene, se asume 0.
+                const descuentoPorcentaje = item.descuentoPorcentaje !== undefined && item.descuentoPorcentaje !== null
+                    ? parseFloat(item.descuentoPorcentaje) : 0;
+                const observacion = item.observacion ? String(item.observacion).trim() : null;
 
                 if (!Number.isInteger(productoId) || !Number.isInteger(cantidadPedida) || cantidadPedida <= 0 || isNaN(costoUnitario) || costoUnitario < 0) {
                     throw new Error(`Ítem de orden inválido: productoId=${item.productoId}, cantidadPedida=${item.cantidadPedida}, costoUnitario=${item.costoUnitario}`);
                 }
+                if (isNaN(descuentoPorcentaje) || descuentoPorcentaje < 0 || descuentoPorcentaje > 100) {
+                    throw new Error(`Descuento inválido para el producto ID ${productoId}: debe estar entre 0 y 100.`);
+                }
 
-                const subtotal = Math.round(cantidadPedida * costoUnitario * 100) / 100;
+                const subtotalBruto = cantidadPedida * costoUnitario;
+                const subtotal = Math.round(subtotalBruto * (1 - descuentoPorcentaje / 100) * 100) / 100;
                 total += subtotal;
-                return { productoId, cantidadPedida, costoUnitario, subtotal };
+                return { productoId, cantidadPedida, costoUnitario, descuentoPorcentaje, observacion, subtotal };
             });
 
             const ordenResult = await new sql.Request(transaction)
@@ -45,10 +53,12 @@ class CompraModel {
                     .input('productoId', sql.Int, item.productoId)
                     .input('cantidadPedida', sql.Int, item.cantidadPedida)
                     .input('costoUnitario', sql.Decimal(18, 2), item.costoUnitario)
+                    .input('descuentoPorcentaje', sql.Decimal(5, 2), item.descuentoPorcentaje)
+                    .input('observacion', sql.NVarChar, item.observacion)
                     .input('subtotal', sql.Decimal(18, 2), item.subtotal)
                     .query(`
-                        INSERT INTO DetalleOrdenesCompra (OrdenCompraId, ProductoId, CantidadPedida, CantidadRecibida, CostoUnitario, Subtotal)
-                        VALUES (@ordenCompraId, @productoId, @cantidadPedida, 0, @costoUnitario, @subtotal)
+                        INSERT INTO DetalleOrdenesCompra (OrdenCompraId, ProductoId, CantidadPedida, CantidadRecibida, CostoUnitario, DescuentoPorcentaje, Observacion, Subtotal)
+                        VALUES (@ordenCompraId, @productoId, @cantidadPedida, 0, @costoUnitario, @descuentoPorcentaje, @observacion, @subtotal)
                     `);
             }
 
@@ -93,7 +103,9 @@ class CompraModel {
             const ordenResult = await pool.request()
                 .input('Id', sql.Int, id)
                 .query(`
-                    SELECT oc.*, p.RazonSocial AS Proveedor, u.Nombre AS Usuario
+                    SELECT oc.*, p.RazonSocial AS Proveedor, p.NIT AS ProveedorNIT,
+                           p.Telefono AS ProveedorTelefono, p.Correo AS ProveedorCorreo,
+                           p.Contacto AS ProveedorContacto, u.Nombre AS Usuario
                     FROM OrdenesCompra oc
                     JOIN Proveedores p ON oc.ProveedorId = p.Id
                     JOIN Usuarios u ON oc.UsuarioId = u.Id
@@ -103,6 +115,7 @@ class CompraModel {
             if (ordenResult.recordset.length === 0) return null;
             const orden = ordenResult.recordset[0];
 
+            // doc.* ya incluye DescuentoPorcentaje y Observacion de cada línea (columnas nuevas)
             const detalleResult = await pool.request()
                 .input('OrdenCompraId', sql.Int, id)
                 .query(`
